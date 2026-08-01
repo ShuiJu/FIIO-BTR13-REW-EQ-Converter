@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Text to XML Converter</title>
+    <title>FIIO BTR13 REW/AutoEQ Converter</title>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -27,15 +27,26 @@
             background-color: #f4f4f4;
             padding: 10px;
             border: 1px solid #ccc;
+            white-space: pre-wrap;
+            word-wrap: break-word;
         }
+        #status {
+            font-size: 13px;
+            color: #666;
+            margin-bottom: 10px;
+            min-height: 18px;
+        }
+        .error { color: #cc0000 !important; }
+        .ok { color: #2a8c2a !important; }
     </style>
 </head>
 <body>
-    <h1>Text to XML Converter</h1>
-    <textarea id="inputText" placeholder="Paste your text here..."></textarea>
+    <h1>FIIO BTR13 EQ Converter</h1>
+    <div id="status"></div>
+    <textarea id="inputText" placeholder="粘贴 REW 导出格式 或 AutoEQ 格式..."></textarea>
     <br>
     <label for="masterGain">Master Gain (integer):</label>
-    <input type="number" id="masterGain" placeholder="-2">
+    <input type="number" id="masterGain" placeholder="留空则用 Preamp 或默认 -2">
     <br>
     <label for="styleName">Style Name (max 36 chars):</label>
     <input type="text" id="styleName" maxlength="36" placeholder="调音名称，上限36字符">
@@ -49,6 +60,8 @@
     <pre id="outputXML"></pre>
 
     <script>
+        const MAX_BANDS = 10;
+
         function getCurrentTimestamp() {
             const now = new Date();
             const year = now.getFullYear();
@@ -60,14 +73,100 @@
             return `${year}${month}${date}_${hours}${minutes}${seconds}`;
         }
 
+        function setTypeStatus(msg, cls) {
+            const el = document.getElementById('status');
+            el.textContent = msg;
+            el.className = cls || '';
+        }
+
+        function detectFormat(inputText) {
+            if (/Preamp:/i.test(inputText) || /Filter\s+\d+:\s+(ON|OFF)\s+/i.test(inputText)) {
+                return 'autoeq';
+            }
+            if (/\t/.test(inputText)) {
+                return 'rew';
+            }
+            return 'autoeq';
+        }
+
+        function typeToCode(type) {
+            const t = type.toUpperCase();
+            if (t === 'PK') return 0;
+            if (t === 'LSQ' || t === 'LS_Q' || t === 'LSC' || t === 'LSSH' || t === 'LS') return 1;
+            if (t === 'HSQ' || t === 'HS_Q' || t === 'HSC' || t === 'HSSH' || t === 'HS') return 2;
+            setTypeStatus(`警告：未知滤波器类型 "${t}"，将作为 PK(0) 处理`, 'error');
+            return 0;
+        }
+
+        function parseAutoEQ(lines) {
+            const filters = [];
+            let preamp = null;
+
+            for (const line of lines) {
+                const preampMatch = line.match(/Preamp:\s*(-?[\d.]+)\s*dB/i);
+                if (preampMatch) {
+                    preamp = parseFloat(preampMatch[1]);
+                    continue;
+                }
+
+                const m = line.match(/Filter\s+(\d+):\s+(ON|OFF)\s+(\w+)\s+Fc\s+([\d.]+)\s+Hz\s+Gain\s+(-?[\d.]+)\s+dB\s+Q\s+([\d.]+)/i);
+                if (!m) continue;
+
+                const filterIndex = parseInt(m[1]);
+                const state = m[2].toUpperCase();
+                const type = m[3].toUpperCase();
+                const freq = parseFloat(m[4]);
+                const gain = parseFloat(m[5]);
+                const q = parseFloat(m[6]);
+
+                if (state === 'OFF') continue;
+
+                filters.push({ type, freq, gain, q, index: filterIndex });
+            }
+            return { filters, preamp };
+        }
+
+        function parseREW(lines) {
+            const filters = [];
+            // REW tab-separated: header is the first 2 lines, channels start at line index 2
+            let preamp = null;
+
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                // Try to detect preamp from header if present
+                const preampMatch = line.match(/Preamp:\s*(-?[\d.]+)\s*dB/i);
+                if (preampMatch) {
+                    preamp = parseFloat(preampMatch[1]);
+                }
+            }
+
+            for (let i = 2; i < lines.length && filters.length < MAX_BANDS; i++) {
+                const columns = lines[i].split('\t');
+                if (!columns || columns.length < 5) continue;
+
+                const rawType = (columns[3] || 'PK').trim();
+                const freq = parseFloat(columns[4]) || (i - 2) * 10;
+                const gain = parseFloat(columns[5]) || 0;
+                const q = parseFloat(columns[6]) || 1;
+
+                filters.push({ type: rawType, freq, gain, q });
+            }
+            return { filters, preamp };
+        }
+
         function convertToXML() {
             const inputText = document.getElementById('inputText').value;
-            const masterGain = document.getElementById('masterGain').value || -2;
+            let masterGainInput = document.getElementById('masterGain').value;
             let styleName = document.getElementById('styleName').value.trim();
             let description = document.getElementById('description').value.trim();
 
-            const timestamp = getCurrentTimestamp();
+            if (!inputText.trim()) {
+                setTypeStatus('错误：请先粘贴 EQ 配置', 'error');
+                document.getElementById('outputXML').textContent = '';
+                return;
+            }
 
+            const timestamp = getCurrentTimestamp();
             if (!styleName) {
                 styleName = `未命名调音_${timestamp}`;
             }
@@ -78,29 +177,44 @@
             }
 
             const lines = inputText.split('\n');
-            const eqList = [];
-
-            for (let i = 2; i < 12; i++) { // Extract channels 1 to 10
-                const columns = lines[i]?.split('\t');
-                if (!columns || columns.length < 5) continue;
-
-                const type = columns[3]?.trim();
-                const freq = parseFloat(columns[4]) || (i - 2) * 10;
-                const gain = parseFloat(columns[5]) || 0;
-                const q = parseFloat(columns[6]) || 1;
-
-                let typeCode = 0; // Default type
-                if (type === 'PK') typeCode = 0;
-                else if (type === 'LS_Q') typeCode = 1;
-                else if (type === 'HS_Q') typeCode = 2;
-
-                eqList.push(`        <eq index="${i - 2}">
-          <param name="type">${typeCode}</param>
-          <param name="freq">${freq}</param>
-          <param name="gain">${gain}</param>
-          <param name="q">${q}</param>
-        </eq>`);
+            const format = detectFormat(inputText);
+            let parsed;
+            if (format === 'autoeq') {
+                parsed = parseAutoEQ(lines);
+                setTypeStatus(`检测到 AutoEQ 文本格式`, 'ok');
+            } else {
+                parsed = parseREW(lines);
+                setTypeStatus(`检测到 REW 导出(Tab分隔)格式`, 'ok');
             }
+
+            let filters = parsed.filters.slice(0, MAX_BANDS);
+            const preamp = parsed.preamp;
+
+            // Pad to MAX_BANDS with default values (disabled PK at 0 Hz)
+            while (filters.length < MAX_BANDS) {
+                filters.push({ type: 'PK', freq: 0, gain: 0, q: 1 });
+            }
+
+            // Determine masterGain
+            let masterGain;
+            if (masterGainInput !== '') {
+                masterGain = parseInt(masterGainInput);
+            } else if (preamp !== null) {
+                masterGain = Math.round(preamp);
+                document.getElementById('masterGain').value = masterGain;
+            } else {
+                masterGain = -2;
+            }
+
+            const eqList = filters.map((f, idx) => {
+                const typeCode = typeToCode(f.type);
+                return `        <eq index="${idx}">
+          <param name="type">${typeCode}</param>
+          <param name="freq">${f.freq}</param>
+          <param name="gain">${f.gain}</param>
+          <param name="q">${f.q}</param>
+        </eq>`;
+            });
 
             const xml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <FiiO_DSP model="FIIO BTR13" version="0.0.1">
@@ -128,6 +242,10 @@ ${eqList.join('\n')}
             }
 
             const xmlContent = document.getElementById('outputXML').textContent;
+            if (!xmlContent) {
+                setTypeStatus('错误：请先点击 Convert 生成 XML', 'error');
+                return;
+            }
             const blob = new Blob([xmlContent], { type: 'application/xml' });
             const link = document.createElement('a');
             link.href = URL.createObjectURL(blob);
